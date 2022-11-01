@@ -1,6 +1,10 @@
 /*
 
-   -Use hash table to lookup connection pointer instead of linear scan
+   	- Rewrite first packet HOST packet code. It's pretty TRASH.
+
+   	- Use hash table to lookup connection pointer instead of linear scan
+
+	- local ip can change, get based on MAC address? http://www.microhowto.info/howto/get_the_ip_address_of_a_network_interface_in_c_using_siocgifaddr.html
 
 
 */
@@ -91,7 +95,24 @@ void add_epoll_fd(uint32_t events, int ep, int fd) {
 	}
 }
 
-uint8_t add_connection(int serverfd, int ep, connection *conns, int *conncount) {
+void free_buffer(intptr_t **freebufs, uint8_t *buf) {
+	*(intptr_t *)buf = (intptr_t)*freebufs;
+	*freebufs = (intptr_t *)buf;
+}
+
+uint8_t *get_buffer(intptr_t **freebufs) {
+	uint8_t *result = 0;
+	if(*freebufs) {
+		result = (uint8_t *)*freebufs;
+		*freebufs = (intptr_t *)**freebufs;
+	} else {
+		result = malloc(BUFSIZE);
+	}
+
+	return result;
+}
+
+uint8_t add_connection(int serverfd, int ep, connection *conns, int *conncount, intptr_t **freebufs) {
 	struct sockaddr_storage their_addr;
 	socklen_t addr_size = sizeof(their_addr);
 	int clientfd = accept(serverfd, (struct sockaddr *)&their_addr, &addr_size);
@@ -106,17 +127,19 @@ uint8_t add_connection(int serverfd, int ep, connection *conns, int *conncount) 
 	memset(conn, 0, sizeof(connection));
 	conn->clientfd = clientfd;
 	conn->serverfd = -1;
-	conn->client_buf.data = malloc(BUFSIZE);
-	conn->server_buf.data = malloc(BUFSIZE);
+	conn->client_buf.data = get_buffer(freebufs);
+	conn->server_buf.data = get_buffer(freebufs);
 	*conncount = (*conncount) + 1;
 	return 1;
 }
 
-void kill_connection(connection *conns, int *conncount, int i) {
-	printf("killing connection...\n");
+void kill_connection(connection *conns, int *conncount, int i, intptr_t **freebufs) {
 	connection *conn = conns + i;
 	close(conn->clientfd);
 	close(conn->serverfd);
+
+	free_buffer(freebufs, conn->client_buf.data);
+	free_buffer(freebufs, conn->server_buf.data);
 
 	(*conncount) = (*conncount) - 1;
 	if((*conncount) >= 0) {
@@ -153,7 +176,6 @@ void set_write_ready(int fd, connection *conns, int conncount) {
 void read_to_buffer(int *fd, buffer *buf, uint8_t *read_ready) {
 	while(*read_ready && !is_buf_full(buf)) {
 		int nbytes = recv(*fd, buf->data + buf->len, BUFSIZE - buf->len, 0);
-		printf("read %d bytes\n", nbytes);
 		if(nbytes == 0) {
 			*fd = -1;
 			*read_ready = 0;
@@ -171,7 +193,6 @@ void read_to_buffer(int *fd, buffer *buf, uint8_t *read_ready) {
 void write_from_buffer(int *fd, buffer *buf, uint8_t *write_ready) {
 	while(*write_ready && !is_buf_empty(buf)) {
 		int nbytes = send(*fd, buf->data + buf->sent, buf->len - buf->sent, MSG_NOSIGNAL);
-		printf("wrote %d bytes\n", nbytes);
 		if(nbytes == 0) {
 			*fd = -1;
 			*write_ready = 0;
@@ -222,16 +243,17 @@ int main() {
 	connection conns[MAXCONNS];
 	int conncount = 0;
 
+	intptr_t *freebufs = 0;
+	time_t last_print = 0;
+
 	for(;;) {
-		printf("waiting for poll event...\n");
 		int fdcount = epoll_wait(ep, events, arrlen(events), -1);
 		for(int i = 0; i < fdcount; i++) {
-			printf("poll event\n");
 			struct epoll_event *event = events + i;
 			int sockfd = event->data.fd;
 			if(event->data.fd == serverfd) {
 				if(event->events == EPOLLIN) {
-					uint8_t added = add_connection(serverfd, ep, conns, &conncount);
+					uint8_t added = add_connection(serverfd, ep, conns, &conncount, &freebufs);
 				} else {
 					fprintf(stderr, "server event not EPOLLIN but %d\n", event->events);
 					exit(1);
@@ -241,7 +263,6 @@ int main() {
 					set_read_ready(sockfd, conns, conncount);
 				}
 				if(event->events & EPOLLOUT) {
-					printf("\n\n\n%d write ready\n\n\n", sockfd);
 					set_write_ready(sockfd, conns, conncount);
 				} 
 				if((events->events & (EPOLLIN|EPOLLOUT)) == 0) {
@@ -254,7 +275,9 @@ int main() {
 		for(int i = 0; i < conncount; i++) {
 			connection *conn = conns + i;
 			if(!conn->tunneled) {
-				while(conn->clientfd >= 0 && conn->clientfd_read_ready && !is_buf_full(&conn->client_buf)) {
+
+				// Refactor: is_buf_full is not necessary it is checked inside read_to_buffer
+				while(conn->clientfd >= 0 && conn->clientfd_read_ready) { // && !is_buf_full(&conn->client_buf)) {
 					read_to_buffer(&conn->clientfd, &conn->client_buf, &conn->clientfd_read_ready);
 				}
 				if(conn->client_buf.len >= 10) {
@@ -263,11 +286,13 @@ int main() {
 						!strncmp((char *)conn->client_buf.data, "POST ", 5) 	|| 
 						!strncmp((char *)conn->client_buf.data, "DELETE ", 7) 	|| 
 						!strncmp((char *)conn->client_buf.data, "OPTIONS ", 8) 	|| 
-						!strncmp((char *)conn->client_buf.data, "PUT ", 4);
+						!strncmp((char *)conn->client_buf.data, "PUT ", 4)		||
+						!strncmp((char *)conn->client_buf.data, "CONNECT ", 8);
 
 					if(method_match) {
 						uint8_t found_host = 0;
 						char host[256];
+						char *port = "80";
 						int i = get_next_line(&conn->client_buf, 0);
 						while(i >= 0) {
 							if(!strncmp((char *)conn->client_buf.data + i, "\r\nHost: ", 8)) {
@@ -278,36 +303,70 @@ int main() {
 									memcpy(host, conn->client_buf.data + i + 2 + 6, hostlen);
 									host[hostlen] = 0;
 									found_host = 1;
+
+									for(int i = 0; i < hostlen; i++) {
+										if(host[i] == ':') {
+											host[i] = 0;
+											port = host + i + 1;
+											break;
+										}
+									}
 									break;
 								} else {
 									fatal_error("host length too long");
 								}
 							} else {
-								i += get_next_line(&conn->client_buf, i+2);
+								i += get_next_line(&conn->client_buf, i + 2) + 2;
 							}
 						}
+
+						//printf("Host: %s\n", host);
+						//printf("Port: %s\n", port);
 
 						if(found_host) {
 							struct addrinfo hints;
 							struct addrinfo *ai;
 							memset(&hints, 0, sizeof(struct addrinfo));
-							hints.ai_family = AF_UNSPEC;
+							hints.ai_family = AF_INET;
 							hints.ai_socktype= SOCK_STREAM;
-							printf("host=%s\n", host);
-							if(getaddrinfo(host, "80", &hints, &ai) != 0) {
-								fatal_error("getaddrinfo");
+							hints.ai_flags = AI_PASSIVE; // remove when start using local_addr?
+							if(getaddrinfo(host, port, &hints, &ai) == 0) {
+								int serverfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+								if(serverfd < 0) {
+									fatal_error("socket");
+								}
+
+								/*struct sockaddr_in local_addr;
+								memset(&local_addr, 0, sizeof(local_addr));
+								local_addr.sin_family = AF_INET;
+								//local_addr.sin_addr.s_addr = inet_addr("100.106.126.13");
+								//local_addr.sin_addr.s_addr = inet_addr("192.168.1.9");
+								local_addr.sin_port = htons(0);
+								if(bind(serverfd, (struct sockaddr *)&local_addr, sizeof(struct sockaddr)) != 0) {
+									printf("errno=%d\n", errno);
+									fatal_error("bind");
+								}*/
+
+								if(connect(serverfd, ai->ai_addr, ai->ai_addrlen) == 0) {
+									conn->serverfd = serverfd;
+									fcntl(serverfd, F_SETFL, O_NONBLOCK);
+									add_epoll_fd(EPOLLIN | EPOLLOUT | EPOLLET, ep, serverfd);
+
+									if(!strncmp((char *)conn->client_buf.data, "CONNECT ", 8)) {
+										conn->client_buf.len = 0;
+										char *resp = "HTTP/1.1 200 Connection Established\r\n\r\n";
+										int respbytes = strlen(resp);
+										memcpy(conn->server_buf.data, resp, respbytes);
+										conn->server_buf.len = respbytes;
+									}
+								} else {
+									printf("failed to connect\n");
+								}
+							} else{
+								printf("failed to getaddrinfo\n");
 							}
-							int serverfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-							if(serverfd < 0) {
-								fatal_error("socket");
-							}
-							if(connect(serverfd, ai->ai_addr, ai->ai_addrlen) != 0) {
-								fatal_error("connect");
-							}
-							conn->serverfd = serverfd;
+
 							conn->tunneled = 1;
-							fcntl(serverfd, F_SETFL, O_NONBLOCK);
-							add_epoll_fd(EPOLLIN | EPOLLOUT | EPOLLET, ep, serverfd);
 						} else {
 							fatal_error("did not find host");
 						}
@@ -325,16 +384,14 @@ int main() {
 				connection *conn = conns + i;
 				if(conn->clientfd >= 0) read_to_buffer(&conn->clientfd, &conn->client_buf, &conn->clientfd_read_ready);
 				if(conn->serverfd >= 0) write_from_buffer(&conn->serverfd, &conn->client_buf, &conn->serverfd_write_ready);
-				printf("reading from server...\n");
 				if(conn->serverfd >= 0) read_to_buffer(&conn->serverfd, &conn->server_buf, &conn->serverfd_read_ready);
-				printf("clientfd = %d client write ready = %d\n", conn->clientfd, conn->clientfd_write_ready);
 				if(conn->clientfd >= 0) write_from_buffer(&conn->clientfd, &conn->server_buf, &conn->clientfd_write_ready);
 
 				keep_going = 
-					(conn->serverfd_write_ready && !is_buf_empty(&conn->client_buf)) ||
-					(conn->clientfd_write_ready && !is_buf_empty(&conn->server_buf)) ||
-					(conn->serverfd_read_ready && !is_buf_full(&conn->server_buf)) ||
-					(conn->clientfd_read_ready && !is_buf_full(&conn->client_buf));
+					(conn->serverfd >= 0 && conn->serverfd_write_ready && !is_buf_empty(&conn->client_buf)) ||
+					(conn->clientfd >= 0 && conn->clientfd_write_ready && !is_buf_empty(&conn->server_buf)) ||
+					(conn->serverfd >= 0 && conn->serverfd_read_ready && !is_buf_full(&conn->server_buf)) ||
+					(conn->clientfd >= 0 && conn->clientfd_read_ready && !is_buf_full(&conn->client_buf));
 
 			} while(keep_going);
 		}	
@@ -350,29 +407,16 @@ int main() {
 				(!clientfd_closed && !is_buf_empty(&conn->server_buf));
 
 			if(!keep_going) {
-				kill_connection(conns, &conncount, i);
+				kill_connection(conns, &conncount, i, &freebufs);
 			} else {
 				i++;
 			}
 		}
+
+		time_t now = time(0);
+		if(now - last_print >= 10) {
+			printf("connections=%4d\n", conncount);
+			last_print = now;
+		}
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
