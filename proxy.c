@@ -232,12 +232,12 @@ int get_next_line(buffer *buf, int i) {
 	return find_pattern(buf->data + i, buf->len - i, (uint8_t *)"\r\n", 2);
 }
 
-int main() {
+int main(int argc, char **argv) {
 	int ep = epoll_create(20);
 	if(ep < 0) {
 		fatal_error("epoll_create");
 	}
-	int serverfd = get_server_socket(0, "6969");
+	int serverfd = get_server_socket(0, argv[1]);
 	add_epoll_fd(EPOLLIN, ep, serverfd);
 	struct epoll_event events[32];
 	connection conns[MAXCONNS];
@@ -336,16 +336,15 @@ int main() {
 									fatal_error("socket");
 								}
 
-								/*struct sockaddr_in local_addr;
+								struct sockaddr_in local_addr;
 								memset(&local_addr, 0, sizeof(local_addr));
 								local_addr.sin_family = AF_INET;
-								//local_addr.sin_addr.s_addr = inet_addr("100.106.126.13");
-								//local_addr.sin_addr.s_addr = inet_addr("192.168.1.9");
+								local_addr.sin_addr.s_addr = inet_addr(argv[2]);
 								local_addr.sin_port = htons(0);
 								if(bind(serverfd, (struct sockaddr *)&local_addr, sizeof(struct sockaddr)) != 0) {
 									printf("errno=%d\n", errno);
 									fatal_error("bind");
-								}*/
+								}
 
 								if(connect(serverfd, ai->ai_addr, ai->ai_addrlen) == 0) {
 									conn->serverfd = serverfd;
