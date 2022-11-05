@@ -76,6 +76,10 @@ int get_server_socket(char *listen_ip, char *port) {
 	if(sock < 0) {
 		fatal_error("socket");
 	}
+	int reuse = 1;
+	if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(int)) != 0) {
+		fatal_error("setsockopt");
+	}
 	if(bind(sock, ai->ai_addr, ai->ai_addrlen) < 0) {
 		fatal_error("bind");
 	}
@@ -83,6 +87,7 @@ int get_server_socket(char *listen_ip, char *port) {
 		fatal_error("listen");
 	}
 	freeaddrinfo(ai);
+
 	return sock;
 }
 
@@ -237,7 +242,7 @@ int main(int argc, char **argv) {
 	if(ep < 0) {
 		fatal_error("epoll_create");
 	}
-	int serverfd = get_server_socket(0, argv[1]);
+	int serverfd = get_server_socket(argv[1], argv[2]);
 	add_epoll_fd(EPOLLIN, ep, serverfd);
 	struct epoll_event events[32];
 	connection conns[MAXCONNS];
@@ -336,7 +341,7 @@ int main(int argc, char **argv) {
 									fatal_error("socket");
 								}
 
-								struct sockaddr_in local_addr;
+								/*struct sockaddr_in local_addr;
 								memset(&local_addr, 0, sizeof(local_addr));
 								local_addr.sin_family = AF_INET;
 								local_addr.sin_addr.s_addr = inet_addr(argv[2]);
@@ -344,7 +349,7 @@ int main(int argc, char **argv) {
 								if(bind(serverfd, (struct sockaddr *)&local_addr, sizeof(struct sockaddr)) != 0) {
 									printf("errno=%d\n", errno);
 									fatal_error("bind");
-								}
+								}*/
 
 								if(connect(serverfd, ai->ai_addr, ai->ai_addrlen) == 0) {
 									conn->serverfd = serverfd;
